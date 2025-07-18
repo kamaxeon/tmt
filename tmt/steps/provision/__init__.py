@@ -355,6 +355,22 @@ class GuestCapability(enum.Enum):
     #: Read and clear all messages remaining in the ring buffer.
     SYSLOG_ACTION_READ_CLEAR = 'syslog-action-read-clear'
 
+    # Guest supports logs
+    LOG = 'log'
+
+
+class ProvisioningState(enum.Enum):
+    """
+    Represents the current state of guest provisioning.
+
+    States track the lifecycle of guest provisioning from initial request
+    to final outcome, helping external tools monitor provisioning progress.
+    """
+
+    PENDING = 'pending'       # Initial state, provisioning not yet started
+    READY = 'ready'          # Successfully provisioned and ready for use
+    FAILED = 'failed'        # Provisioning failed
+
 
 @container
 class GuestFacts(SerializableContainer):
@@ -954,6 +970,13 @@ class GuestData(SerializableContainer):
     #: Guest topology hostname or IP address for guest/guest communication.
     topology_address: Optional[str] = None
 
+    #: Current provisioning state of the guest.
+    state: ProvisioningState = field(
+        default=ProvisioningState.PENDING,
+        serialize=lambda state: state.value,
+        unserialize=lambda value: ProvisioningState(value) if value else ProvisioningState.PENDING,
+    )
+
     role: Optional[str] = field(
         default=None,
         option='--role',
@@ -1160,9 +1183,15 @@ class Guest(tmt.utils.Common):
     #: Guest topology hostname or IP address for guest/guest communication.
     topology_address: Optional[str] = None
 
+    #: Current provisioning state of the guest.
+    state: ProvisioningState = ProvisioningState.PENDING
+
     become: bool
 
     hardware: Optional[tmt.hardware.Hardware]
+
+    # Needed for extract_from to work correctly
+    _OPTIONLESS_FIELDS = ('primary_address', 'topology_address', 'facts')
 
     # Flag to indicate localhost guest, requires special handling
     localhost = False
@@ -3306,6 +3335,19 @@ class Provision(tmt.steps.Step):
         # Provision guests
         self.guests = []
 
+        # Generate initial guests.yaml with all guests in 'pending' state before provisioning starts
+        # This helps Testing Farm and other tools to access guest information even if provisioning fails
+        initial_guest_data = {}
+        for phase in self.phases(classes=ProvisionPlugin):
+            if isinstance(phase, ProvisionPlugin) and phase.enabled_by_when:
+                guest_data = phase.get_data_class.from_plugin(phase)
+                guest_data.state = ProvisioningState.PENDING
+                initial_guest_data[phase.data.name] = guest_data.to_serialized()
+
+        if initial_guest_data:
+            self.write(Path('guests.yaml'), tmt.utils.dict_to_yaml(initial_guest_data))
+            self.debug('Generated initial guests.yaml with pending guests.')
+
         def _run_provision_phases(
             phases: list[ProvisionPlugin[ProvisionStepData]],
         ) -> tuple[list[ProvisionTask], list[ProvisionTask]]:
@@ -3337,9 +3379,29 @@ class Provision(tmt.steps.Step):
                     failed_tasks.append(outcome)
 
                 if outcome.guest:
+                    # Update guest state based on provisioning outcome
+                    if outcome.exc:
+                        outcome.guest.state = ProvisioningState.FAILED
+                    else:
+                        outcome.guest.state = ProvisioningState.READY
+
                     outcome.guest.show()
 
                     self.guests.append(outcome.guest)
+
+                    # Update guests.yaml with current state after each guest is processed
+                    try:
+                        # First load existing data if any
+                        try:
+                            raw_guest_data = tmt.utils.yaml_to_dict(self.read(Path('guests.yaml')))
+                        except tmt.utils.FileError:
+                            raw_guest_data = {}
+
+                        # Update with current guest data
+                        raw_guest_data[outcome.guest.name] = outcome.guest.save().to_serialized()
+                        self.write(Path('guests.yaml'), tmt.utils.dict_to_yaml(raw_guest_data))
+                    except Exception as exc:
+                        self.debug(f'Failed to update guests.yaml: {exc}')
 
             return all_tasks, failed_tasks
 
